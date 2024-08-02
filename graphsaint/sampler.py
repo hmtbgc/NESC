@@ -10,24 +10,22 @@ from dgl.sampling import random_walk, pack_traces
 from tqdm import tqdm
 
 class SAINTSampler(object):
-    def __init__(self, g, num_roots, length, args):
+    def __init__(self, g, train_nid, num_roots, length, num_repeat=50):
         self.g = g
+        self.train_g = self.g.subgraph(train_nid)
         self.subgraphs = []
         self.N = 0
         self.length = length
+        self.num_roots = num_roots
         sampled_nodes = 0
-        train_idx = torch.where(g.ndata['train_mask'] == 1)[0]
-        idx = torch.randperm(train_idx.shape[0])
+        while sampled_nodes <= self.train_g.num_nodes() * num_repeat:
+            subgraph = self.__sample__()
+            self.subgraphs.append(subgraph)
+            sampled_nodes += subgraph.shape[0]
+            self.N += 1
         
-        for i in tqdm(range(0, train_idx.shape[0], num_roots)):
-            batch_idx = idx[i : i + num_roots]
-            seeds = train_idx[batch_idx]
-            traces, types = random_walk(self.g, nodes=seeds, length=self.length)
-            sampled_nodes, _, _, _ = pack_traces(traces, types)
-            sampled_nodes = sampled_nodes.unique()
-            self.subgraphs.append(self.g.subgraph(sampled_nodes))
-            
-        self.num_batch = len(self.subgraphs)
+        self.num_batch = math.ceil(self.train_g.num_nodes() / (num_roots * length))
+        random.shuffle(self.subgraphs)
     
     def __len__(self):
         return self.num_batch
@@ -38,11 +36,21 @@ class SAINTSampler(object):
     
     def __next__(self):
         if self.n < self.num_batch:
-            result = self.subgraphs[self.n]
+            result = self.train_g.subgraph(self.subgraphs[self.n])
             self.n += 1
             return result
         else:
+            random.shuffle(self.subgraphs)
             raise StopIteration()
+    
+    def __sample__(self):
+        sampled_roots = torch.randint(0, self.train_g.num_nodes(), (self.num_roots, ))
+        traces, types = random_walk(self.train_g, nodes=sampled_roots, length=self.length)
+        sampled_nodes, _, _, _ = pack_traces(traces, types)
+        sampled_nodes = sampled_nodes.unique()
+        return sampled_nodes.numpy()
+    
+
     
     
     

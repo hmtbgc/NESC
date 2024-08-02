@@ -15,14 +15,15 @@ class CustomDataset():
         feats = np.load(os.path.join(file_path, 'feats.npy'))
         class_map = json.load(open(os.path.join(file_path, 'class_map.json')))
         class_map = {int(k): v for k, v in class_map.items()}
-        scaler = StandardScaler()
-        scaler.fit(feats)
-        feats = scaler.transform(feats)
-        feats = feats.astype(np.float32)
         
         train_idx = torch.tensor(role['tr'])
         val_idx = torch.tensor(role['va'])
         test_idx = torch.tensor(role['te'])
+        
+        scaler = StandardScaler()
+        scaler.fit(feats[train_idx])
+        feats = scaler.transform(feats)
+        feats = feats.astype(np.float32)
         feats = torch.tensor(feats)
         g = dgl.from_scipy(adj_full)
         

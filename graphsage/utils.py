@@ -14,6 +14,7 @@ def calc_f1(y_true, y_pred, multilabel):
         y_pred[y_pred <= 0] = 0
     else:
         y_pred = np.argmax(y_pred, axis=1)
+    
     return f1_score(y_true, y_pred, average="micro")
 
 def evaluate(model, g, labels, mask, multilabel, test):

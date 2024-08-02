@@ -14,7 +14,8 @@ from ogb.nodeproppred import DglNodePropPredDataset
 from logger import *
 
 
-def train(g, model, args, device):
+def train(train_g, val_g, model, args, device):
+    torch.cuda.synchronize(device)
     st = time.time()
     
     sampler = dgl.dataloading.LaborSampler(
@@ -24,8 +25,8 @@ def train(g, model, args, device):
     )
 
     dataloader = dgl.dataloading.DataLoader(
-        g,
-        torch.where(g.ndata['train_mask'] == 1)[0],
+        train_g,
+        torch.where(train_g.ndata['train_mask'] == 1)[0],
         sampler,
         batch_size=args.batch_size,
         shuffle=True,
@@ -37,6 +38,7 @@ def train(g, model, args, device):
     for _, seeds, blocks in tqdm(dataloader):
         batch_datas.append([blocks, seeds])
 
+    torch.cuda.synchronize(device)
     ed = time.time()
 
     PRINT_LOG(f'preprocess time: {ed - st:.2f}s', file=file)
@@ -51,13 +53,14 @@ def train(g, model, args, device):
     
     for e in range(args.epoch):
         
+        torch.cuda.synchronize(device)
         st = time.time()
         model.train()
         
         for batch_data in batch_datas:
             blocks, seeds = batch_data[0], batch_data[1]
-            batch_inputs = g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
-            batch_labels = g.ndata['label'][seeds].to(device)
+            batch_inputs = train_g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
+            batch_labels = train_g.ndata['label'][seeds].to(device)
             blocks = [blk.to(device) for blk in blocks]
             pred = model.minibatch_forward(blocks, batch_inputs)
             if (args.multilabel):
@@ -69,7 +72,8 @@ def train(g, model, args, device):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
             optimizer.step()
-                        
+
+        torch.cuda.synchronize(device)
         ed = time.time()
         print(f'epoch time == {ed - st:.3f}s')
         train_time += (ed - st)
@@ -77,7 +81,7 @@ def train(g, model, args, device):
     
         if e > 0 and e % args.every_val == 0:
             model.eval()
-            val_f1 = evaluate(model, g, g.ndata['label'], g.ndata['val_mask'], args.multilabel, False)
+            val_f1 = evaluate(model, val_g, val_g.ndata['label'], val_g.ndata['val_mask'], args.multilabel, False)
             history.append((e, round(train_time, 2), round(val_f1, 4)))
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
@@ -116,8 +120,20 @@ def mem_bench(device, g, model, multilabel, args):
     )
 
     batch_datas = []
+    N, E = [], []
     for _, seeds, blocks in tqdm(dataloader):
         batch_datas.append([blocks, seeds])
+        nodes, edges = 0, 0
+        for block in blocks:
+            nodes += block.num_src_nodes()
+            edges += block.num_edges()
+        nodes += blocks[-1].num_dst_nodes()
+        N.append(nodes)
+        E.append(edges)
+    
+    PRINT_LOG(f"N_all: {int(np.mean(N))}", file=file)
+    PRINT_LOG(f"E_all: {int(np.mean(E))}", file=file)
+    
 
     
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -163,7 +179,7 @@ if __name__ == "__main__":
     file = new_log(f'./log', args)    
     fullbatch_eval_dataset = set(['flickr', 'ogbn-arxiv', 'reddit'])
     minibatch_eval_dataset = set(['amazon', 'ogbn-products'])
-    multilabel_dataset = set(['amazon'])
+    multilabel_dataset = set(['amazon', 'yelp'])
     args.multilabel = args.dataset in multilabel_dataset
     args.fullbatch = args.dataset in fullbatch_eval_dataset
     
@@ -175,6 +191,13 @@ if __name__ == "__main__":
         dataset = CustomDataset(dataset_root, args.dataset)
     g = dataset[0]
     g = dgl.to_bidirected(g, copy_ndata=True)
+    
+    train_idx = torch.where(g.ndata['train_mask'] == True)[0]
+    val_idx = torch.where(g.ndata['val_mask'] == True)[0]
+    test_idx = torch.where(g.ndata['test_mask'] == True)[0]
+    train_g = g.subgraph(train_idx)
+    val_g = g.subgraph(torch.concat([train_idx, val_idx]))
+    test_g = g
 
     in_feats = g.ndata['feat'].shape[1]
     num_classes = dataset.num_classes
@@ -184,7 +207,7 @@ if __name__ == "__main__":
     if args.memory == 1:
         model = GNN(in_feats=in_feats, h_feats=args.h_feats, num_classes=num_classes, n_layer=args.n_layer, dropout=args.dropout, device=device)
         model = model.to(device)
-        mem_bench(device, g, model, args.multilabel, args)
+        mem_bench(device, train_g, model, args.multilabel, args)
         
     else:
     
@@ -194,10 +217,10 @@ if __name__ == "__main__":
             model = model.to(device)
 
 
-            train_time, history = train(g, model, args, device)
+            train_time, history = train(train_g, val_g, model, args, device)
         
             PRINT_LOG(f'train time: {train_time:.2f}s', file=file)
-            test_f1 = test(g, model, args)
+            test_f1 = test(test_g, model, args)
             PRINT_LOG(f'test f1: {test_f1 * 100:.2f}%', file=file)
         
             h_time, h_val = [], []

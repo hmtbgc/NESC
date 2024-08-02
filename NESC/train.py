@@ -12,47 +12,71 @@ from dgl import to_block
 from dgl.data import AsNodePredDataset
 from ogb.nodeproppred import DglNodePropPredDataset
 from logger import *
+from custom_sampler import *
 
-
-def train(g, model, args, device):
-    train_idx = torch.where(g.ndata['train_mask'] == 1)[0]
+def train(train_g, val_g, model, args, device):
+    train_idx = torch.where(train_g.ndata['train_mask'] == 1)[0]
     
+    torch.cuda.synchronize(device)
     st = time.time()
     
-    idx = torch.randperm(train_idx.shape[0])
-    tot_blocks = []
-    tot_seeds = []
+    # idx = torch.randperm(train_idx.shape[0])
+    # tot_blocks = []
+    # tot_seeds = []
     
     
-    for i in tqdm(range(0, train_idx.shape[0], args.batch_size)):
+    # for i in tqdm(range(0, train_idx.shape[0], args.batch_size)):
         
-        batch_idx = idx[i : i+args.batch_size]
-        seeds = train_idx[batch_idx]
-        blocks = []
+    #     batch_idx = idx[i : i+args.batch_size]
+    #     seeds = train_idx[batch_idx]
+    #     blocks = []
         
-        for _ in range(args.n_layer):
-            frontier = dgl.sampling.sample_neighbors(g, seeds, args.s1)
-            edges = frontier.edges()
-            node = torch.unique(torch.cat((edges[0], seeds), dim=0))
-            sg = dgl.node_subgraph(g, node)
-            sg = sg.to(device)
-            seeds_gpu = seeds.to(device)
-            m = sg.ndata[dgl.NID]
-            new_u = m[sg.edges()[0]]
-            new_v = m[sg.edges()[1]]
-            new_graph = dgl.graph((new_u, new_v))
-            new_frontier = dgl.sampling.sample_neighbors(new_graph, seeds_gpu, args.s2)
-            block = to_block(new_frontier, seeds_gpu)
-            block = block.to('cpu')
-            blocks.append(block)
-            seeds = block.srcdata[dgl.NID]
+    #     for _ in range(args.n_layer):
+    #         frontier = dgl.sampling.sample_neighbors(train_g, seeds, args.s1)
+    #         edges = frontier.edges()
+    #         node = torch.unique(torch.cat((edges[0], seeds), dim=0))
+    #         sg = dgl.node_subgraph(train_g, node)
+    #         sg = sg.to(device)
+    #         seeds_gpu = seeds.to(device)
+    #         m = sg.ndata[dgl.NID]
+    #         new_u = m[sg.edges()[0]]
+    #         new_v = m[sg.edges()[1]]
+    #         new_graph = dgl.graph((new_u, new_v))
+    #         new_frontier = dgl.sampling.sample_neighbors(new_graph, seeds_gpu, args.s2)
+    #         block = to_block(new_frontier, seeds_gpu)
+    #         block = block.to('cpu')
+    #         blocks.append(block)
+    #         seeds = block.srcdata[dgl.NID]
     
-        tot_blocks.append(blocks[::-1])
-        tot_seeds.append(train_idx[batch_idx])
-        
+    #     tot_blocks.append(blocks[::-1])
+    #     tot_seeds.append(train_idx[batch_idx])
+    
+    custom_sampler = CustomNeigborSampler(args.s1, args.s2, args.layer_max, args.n_layer)
+    dataloader = dgl.dataloading.DataLoader(
+        train_g,
+        torch.where(train_g.ndata['train_mask'] == 1)[0],
+        custom_sampler,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=0
+    )
+    
+    input_size = []
+    
+    batch_datas = []
+    for _, _, blocks in tqdm(dataloader):
+        batch_datas.append(blocks)
+        input_size.append(blocks[0].srcdata[dgl.NID].shape[0])
+    
+    PRINT_LOG(f'input averaged size: {int(np.mean(input_size))}', file=file)        
 
+    torch.cuda.synchronize(device)
     ed = time.time()
     print(f'preprocess time: {ed - st:.2f}s', file=file)
+    
+    # if (args.fullbatch):
+    #     g = g.to(device)
     
     
     history = []
@@ -63,13 +87,13 @@ def train(g, model, args, device):
     
     for e in range(args.epoch):
         
+        torch.cuda.synchronize(device)
         st = time.time()
         model.train()
         
-        for i in range(len(tot_blocks)):
-            blocks, seeds = tot_blocks[i], tot_seeds[i]
-            batch_inputs = g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
-            batch_labels = g.ndata['label'][seeds].to(device)
+        for blocks in batch_datas:
+            batch_inputs = train_g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
+            batch_labels = train_g.ndata['label'][blocks[-1].dstdata[dgl.NID]].to(device)
             blocks = [blk.to(device) for blk in blocks]
             pred = model.minibatch_forward(blocks, batch_inputs)
             if (args.multilabel):
@@ -80,7 +104,8 @@ def train(g, model, args, device):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-                        
+
+        torch.cuda.synchronize(device)
         ed = time.time()
         print(f'epoch time == {ed - st:.3f}s')
         train_time += (ed - st)
@@ -88,7 +113,7 @@ def train(g, model, args, device):
     
         if e > 0 and e % args.every_val == 0:
             model.eval()
-            val_f1 = evaluate(model, g, g.ndata['label'], g.ndata['val_mask'], args.multilabel, False)
+            val_f1 = evaluate(model, val_g, val_g.ndata['label'], val_g.ndata['val_mask'], args.multilabel, False)
             history.append((e, round(train_time, 2), round(val_f1, 4)))
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
@@ -98,56 +123,48 @@ def train(g, model, args, device):
     return train_time, history
     
     
-def test(g, model, args):
+def test(test_g, model, args):
     model.load_state_dict(torch.load(os.path.join('./pt', f'{args.dataset}.pt')))
-    labels = g.ndata['label']
-    test_mask = g.ndata['test_mask']
-    test_f1 = evaluate(model, g, labels, test_mask, multilabel=args.multilabel, test=True)
+    labels = test_g.ndata['label']
+    test_mask = test_g.ndata['test_mask']
+    test_f1 = evaluate(model, test_g, labels, test_mask, multilabel=args.multilabel, test=True)
     return test_f1
 
 def mem_bench(device, g, model, multilabel, args):
     max_mem = 0
     torch.cuda.empty_cache()
     
-    train_idx = torch.where(g.ndata['train_mask'] == 1)[0]
-    
-    idx = torch.randperm(train_idx.shape[0])
-    tot_blocks = []
-    tot_seeds = []
-    
-    
-    for i in tqdm(range(0, train_idx.shape[0], args.batch_size)):
-        
-        batch_idx = idx[i : i+args.batch_size]
-        seeds = train_idx[batch_idx]
-        blocks = []
-        
-        for _ in range(args.n_layer):
-            frontier = dgl.sampling.sample_neighbors(g, seeds, args.s1)
-            edges = frontier.edges()
-            node = torch.unique(torch.cat((edges[0], seeds), dim=0))
-            sg = dgl.node_subgraph(g, node)
-            sg = sg.to(device)
-            seeds_gpu = seeds.to(device)
-            m = sg.ndata[dgl.NID]
-            new_u = m[sg.edges()[0]]
-            new_v = m[sg.edges()[1]]
-            new_graph = dgl.graph((new_u, new_v))
-            new_frontier = dgl.sampling.sample_neighbors(new_graph, seeds_gpu, args.s2)
-            block = to_block(new_frontier, seeds_gpu)
-            block = block.to('cpu')
-            blocks.append(block)
-            seeds = block.srcdata[dgl.NID]
-    
-        tot_blocks.append(blocks[::-1])
-        tot_seeds.append(train_idx[batch_idx])
+    custom_sampler = CustomNeigborSampler(args.s1, args.s2, args.layer_max, args.n_layer)
+    dataloader = dgl.dataloading.DataLoader(
+        train_g,
+        torch.where(train_g.ndata['train_mask'] == 1)[0],
+        custom_sampler,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=0
+    )
     
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
     
-    for i in range(len(tot_blocks)):
-        blocks, seeds = tot_blocks[i], tot_seeds[i]
-        batch_inputs = g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
-        batch_labels = g.ndata['label'][seeds].to(device)
+    batch_datas = []
+    N, E = [], []
+    for _, seeds, blocks in tqdm(dataloader):
+        batch_datas.append(blocks)
+        nodes, edges = 0, 0
+        for block in blocks:
+            nodes += block.num_src_nodes()
+            edges += block.num_edges()
+        nodes += blocks[-1].num_dst_nodes()
+        N.append(nodes)
+        E.append(edges)
+    
+    PRINT_LOG(f"N_all: {int(np.mean(N))}", file=file)
+    PRINT_LOG(f"E_all: {int(np.mean(E))}", file=file)
+    
+    for blocks in batch_datas:
+        batch_inputs = train_g.ndata['feat'][blocks[0].srcdata[dgl.NID]].to(device)
+        batch_labels = train_g.ndata['label'][blocks[-1].dstdata[dgl.NID]].to(device)
         blocks = [blk.to(device) for blk in blocks]
         pred = model.minibatch_forward(blocks, batch_inputs)
         if (args.multilabel):
@@ -158,12 +175,11 @@ def mem_bench(device, g, model, multilabel, args):
         opt.zero_grad()
         loss.backward()
         opt.step()
-                        
         
         peak_usage = torch.cuda.max_memory_allocated(device)
         max_mem = max(max_mem, peak_usage)
         torch.cuda.empty_cache()
-        
+    
     PRINT_LOG(f'cuda peak usage: {max_mem / (1024 ** 2):.2f}MB', file=file)
     
     
@@ -180,14 +196,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--s1", type=int, default=1, help="fanout s1")
     parser.add_argument("--s2", type=int, default=5, help="fanout s2")
+    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--layer_max", type=int, default=20000)
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout ratio")
     parser.add_argument("--memory", type=int, default=0)
     args = parser.parse_args()
     
     file = new_log(f'./log', args)    
     fullbatch_eval_dataset = set(['flickr', 'ogbn-arxiv', 'reddit'])
-    minibatch_eval_dataset = set(['amazon', 'ogbn-products'])
-    multilabel_dataset = set(['amazon'])
+    minibatch_eval_dataset = set(['yelp', 'amazon', 'ogbn-products'])
+    multilabel_dataset = set(['yelp', 'amazon'])
     args.multilabel = args.dataset in multilabel_dataset
     args.fullbatch = args.dataset in fullbatch_eval_dataset
     
@@ -199,6 +217,13 @@ if __name__ == "__main__":
         dataset = CustomDataset(dataset_root, args.dataset)
     g = dataset[0]
     g = dgl.to_bidirected(g, copy_ndata=True)
+    
+    train_idx = torch.where(g.ndata['train_mask'] == True)[0]
+    val_idx = torch.where(g.ndata['val_mask'] == True)[0]
+    test_idx = torch.where(g.ndata['test_mask'] == True)[0]
+    train_g = g.subgraph(train_idx)
+    val_g = g.subgraph(torch.concat([train_idx, val_idx]))
+    test_g = g
 
     in_feats = g.ndata['feat'].shape[1]
     num_classes = dataset.num_classes
@@ -208,21 +233,21 @@ if __name__ == "__main__":
     if args.memory == 1:
         model = GNN(in_feats=in_feats, h_feats=args.h_feats, num_classes=num_classes, n_layer=args.n_layer, dropout=args.dropout, device=device)
         model = model.to(device)
-        mem_bench(device, g, model, args.multilabel, args)
+        mem_bench(device, train_g, model, args.multilabel, args)
         
     else:
         
     
-        for i in range(5):
+        for i in range(3):
         
             model = GNN(in_feats=in_feats, h_feats=args.h_feats, num_classes=num_classes, n_layer=args.n_layer, dropout=args.dropout, device=device)
             model = model.to(device)
 
 
-            train_time, history = train(g, model, args, device)
+            train_time, history = train(train_g, val_g, model, args, device)
             
             PRINT_LOG(f'train time: {train_time:.2f}s', file=file)
-            test_f1 = test(g, model, args)
+            test_f1 = test(test_g, model, args)
             PRINT_LOG(f'test f1: {test_f1 * 100:.2f}%', file=file)
             
             h_time, h_val = [], []
