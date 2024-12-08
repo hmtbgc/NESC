@@ -1,3 +1,5 @@
+## Towards Building a Lightweight and Powerful Computation Graph for Scalable GNN 
+Accepted by WISE 2024 [paper link](https://link.springer.com/chapter/10.1007/978-981-96-0567-5_14)
 ### How to Run
 Download dataset from [Google Drive link](https://drive.google.com/drive/folders/1zycmmDES39zVlbVCYs88JTJ1Wm5FbfLz) or [BaiduYun link(code:f1ao)](https://pan.baidu.com/share/init?surl=SOb0SiSAXavwAcNqkttwcg) and put it at correct place:
 
