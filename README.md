@@ -23,3 +23,9 @@ bash run.sh
 ```
 
 Results will be saved at log directory.
+
+If you find our work is useful, please cite our paper:
+
+``
+Gong, C. et al. (2025). Towards Building a Lightweight and Powerful Computation Graph for Scalable GNN. In: Barhamgi, M., Wang, H., Wang, X. (eds) Web Information Systems Engineering – WISE 2024. WISE 2024. Lecture Notes in Computer Science, vol 15437. Springer, Singapore. https://doi.org/10.1007/978-981-96-0567-5_14
+``
